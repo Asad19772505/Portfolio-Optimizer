@@ -1,0 +1,5 @@
+autogen
+openai
+langchain
+tiktoken
+requests
