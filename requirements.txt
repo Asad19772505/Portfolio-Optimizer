@@ -1,5 +1,6 @@
-autogen
-openai
-langchain
-tiktoken
-requests
+streamlit
+pandas
+numpy
+scipy
+matplotlib
+yfinance==0.2.52
