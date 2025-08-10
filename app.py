@@ -29,69 +29,148 @@ def to_returns(df: pd.DataFrame, price_like=True):
     r = r.select_dtypes(include=[np.number])
     return r.dropna(how="all", axis=1)
 
+def sanitize_assets(returns: pd.DataFrame, min_obs: int = 10) -> pd.DataFrame:
+    """Remove empty columns, too few observations, or zero variance series."""
+    df = returns.copy()
+    df = df.dropna(axis=1, how="all")
+    if min_obs and min_obs > 0:
+        df = df.loc[:, df.count() >= min_obs]
+    # drop zero/near-zero variance series
+    variances = df.var(ddof=1).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    df = df.loc[:, variances > 0]
+    return df
+
 def annualize(ret: pd.DataFrame, freq: str):
-    freq = freq.lower()
+    freq = str(freq).lower()
     periods = {"daily":252, "weekly":52, "monthly":12, "quarterly":4, "yearly":1}[freq]
     mu = ret.mean() * periods
     cov = ret.cov() * periods
     return mu, cov, periods
 
 def portfolio_metrics(w, mu, cov, rf=0.0):
-    w = np.asarray(w)
+    w = np.asarray(w, dtype=float)
     exp_ret = float(w @ mu)
-    vol = float(np.sqrt(w @ cov @ w))
+    vol_sq = float(w @ cov @ w)
+    vol = float(np.sqrt(max(1e-12, vol_sq)))
     sharpe = (exp_ret - rf) / vol if vol > 0 else np.nan
     return exp_ret, vol, sharpe
 
-def solve_qp_max_sharpe(mu, cov, rf, bounds, w_sum=1.0):
-    from scipy.optimize import minimize
-    n = len(mu)
+# -------- Robust Optimizers --------
+from scipy.optimize import minimize
+
+def _bounds_or_default(n, bounds, max_w=1.0, long_only=True):
+    if bounds is not None:
+        return bounds
+    if long_only:
+        return tuple((0.0, min(1.0, max_w)) for _ in range(n))
+    else:
+        m = min(1.0, max_w)
+        return tuple((-m, m) for _ in range(n))
+
+def solve_qp_max_sharpe(mu, cov, rf=0.0, bounds=None, w_sum=1.0):
+    mu = np.asarray(mu, dtype=float).reshape(-1)
+    cov = np.asarray(cov, dtype=float)
+    n = mu.shape[0]
+
+    if n == 0:
+        raise ValueError("No assets available after filtering/cleaning.")
+    if n == 1:
+        # Single asset: fully invest (respect bounds)
+        b = bounds if bounds is not None else [(0.0, 1.0)]
+        lo, hi = b[0]
+        w = np.array([np.clip(w_sum, lo, hi)], dtype=float)
+        _, _, s = portfolio_metrics(w, mu, cov, rf)
+        return w, s
+
+    bnds = bounds if bounds is not None else tuple((0.0, 1.0) for _ in range(n))
+    eps = 1e-12
 
     def neg_sharpe(w):
         _, _, s = portfolio_metrics(w, mu, cov, rf)
         return -s
 
     cons = [{"type": "eq", "fun": lambda w: np.sum(w) - w_sum}]
-    bnds = bounds if bounds is not None else tuple((0.0, 1.0) for _ in range(n))
-    x0 = np.full(n, 1.0/n)
-    res = minimize(neg_sharpe, x0, method="SLSQP", bounds=bnds, constraints=cons, options={"maxiter":1000})
-    return res.x, res
+    x0 = np.full(n, w_sum / n)
 
-def solve_qp_min_vol(mu, cov, target_ret, bounds, w_sum=1.0):
-    from scipy.optimize import minimize
-    n = len(mu)
-    def vol(w): return np.sqrt(w @ cov @ w)
+    res = minimize(neg_sharpe, x0, method="SLSQP", bounds=bnds, constraints=cons,
+                   options={"maxiter": 1000, "ftol": 1e-9})
+    if not res.success:
+        raise RuntimeError(f"Max-Sharpe optimization failed: {res.message}")
+    return res.x, -res.fun
+
+def solve_qp_min_vol(mu, cov, target_ret, bounds=None, w_sum=1.0):
+    mu = np.asarray(mu, dtype=float).reshape(-1)
+    cov = np.asarray(cov, dtype=float)
+    n = mu.shape[0]
+
+    if n == 0:
+        raise ValueError("No assets available after filtering/cleaning.")
+    if n == 1:
+        # Only one asset; target must equal its mu to be feasible
+        b = bounds if bounds is not None else [(0.0, 1.0)]
+        lo, hi = b[0]
+        if not np.isfinite(target_ret):
+            target_ret = mu[0]
+        if abs(target_ret - mu[0]) > 1e-9:
+            raise RuntimeError("Target return infeasible with a single asset.")
+        w = np.array([np.clip(w_sum, lo, hi)], dtype=float)
+        return w, None
+
+    bnds = bounds if bounds is not None else tuple((0.0, 1.0) for _ in range(n))
+
+    def vol(w): 
+        return np.sqrt(max(1e-12, float(w @ cov @ w)))
 
     cons = [
         {"type":"eq", "fun": lambda w: np.sum(w) - w_sum},
-        {"type":"eq", "fun": lambda w: w @ mu - target_ret},
+        {"type":"eq", "fun": lambda w: float(w @ mu) - float(target_ret)},
     ]
-    bnds = bounds if bounds is not None else tuple((0.0, 1.0) for _ in range(n))
-    x0 = np.full(n, 1.0/n)
+    x0 = np.full(n, w_sum / n)
     res = minimize(vol, x0, method="SLSQP", bounds=bnds, constraints=cons, options={"maxiter":1000})
+    if not res.success:
+        raise RuntimeError(f"Min-vol (target) failed: {res.message}")
     return res.x, res
 
-def solve_qp_min_vol_unconstrained(cov, bounds, w_sum=1.0):
-    from scipy.optimize import minimize
+def solve_qp_min_vol_unconstrained(cov, bounds=None, w_sum=1.0):
+    cov = np.asarray(cov, dtype=float)
     n = cov.shape[0]
-    def vol(w): return np.sqrt(w @ cov @ w)
+    if n == 0:
+        raise ValueError("No assets available after filtering/cleaning.")
+    if n == 1:
+        b = bounds if bounds is not None else [(0.0, 1.0)]
+        lo, hi = b[0]
+        w = np.array([np.clip(w_sum, lo, hi)], dtype=float)
+        return w, None
+
+    def vol(w): 
+        return np.sqrt(max(1e-12, float(w @ cov @ w)))
     cons = [{"type":"eq", "fun": lambda w: np.sum(w) - w_sum}]
     bnds = bounds if bounds is not None else tuple((0.0, 1.0) for _ in range(n))
-    x0 = np.full(n, 1.0/n)
+    x0 = np.full(n, w_sum / n)
     res = minimize(vol, x0, method="SLSQP", bounds=bnds, constraints=cons, options={"maxiter":1000})
+    if not res.success:
+        raise RuntimeError(f"Min-vol failed: {res.message}")
     return res.x, res
 
 def efficient_frontier(mu, cov, bounds, rf, points=30, w_sum=1.0):
     """Generate efficient frontier as a DataFrame with Return, Volatility, Sharpe."""
+    mu = np.asarray(mu, dtype=float).reshape(-1)
+    n = mu.shape[0]
+    if n < 2:
+        return pd.DataFrame(columns=["Return", "Volatility", "Sharpe"])
+
     w_min, _ = solve_qp_min_vol_unconstrained(cov, bounds, w_sum=w_sum)
     r_min = float(w_min @ mu)
-    r_max = float(np.max(mu))  # simple upper bound without shorting
+    r_max = float(np.max(mu))
+    if not np.isfinite(r_min) or not np.isfinite(r_max) or r_max <= r_min:
+        r_max = r_min + 1e-4
+
     rs = np.linspace(r_min, r_max, points)
     vols, sharpes = [], []
     for r in rs:
         try:
             w, _ = solve_qp_min_vol(mu, cov, target_ret=r, bounds=bounds, w_sum=w_sum)
-            _, v, s = portfolio_metrics(w, mu, cov, rf)
+            er, v, s = portfolio_metrics(w, mu, cov, rf)
             vols.append(v); sharpes.append(s)
         except Exception:
             vols.append(np.nan); sharpes.append(np.nan)
@@ -164,6 +243,16 @@ if ret_df is None:
     ret_df = to_returns(prices, price_like=True)
     freq = "Monthly"
 
+# Clean/sanitize before stats
+ret_df = sanitize_assets(ret_df, min_obs=10)
+
+if ret_df.shape[1] == 0:
+    st.error("No valid assets after cleaning (all-NaN, too few data points, or zero variance). "
+             "Please adjust your selection/date range or upload more data.")
+    st.stop()
+elif ret_df.shape[1] == 1:
+    st.warning("Only one valid asset found. The optimizer will assign 100% to it.")
+
 # ---------------------------
 # Compute stats
 # ---------------------------
@@ -176,7 +265,7 @@ st.subheader("Inputs & Detected Settings")
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Assets", n)
 c2.metric("Obs (rows)", ret_df.shape[0])
-c3.metric("Frequency", freq)
+c3.metric("Frequency", str(freq))
 c4.metric("Risk-free", nice_percent(rf))
 
 with st.expander("Annualized stats"):
@@ -193,14 +282,21 @@ target_ret = None
 if objective == "Target Return (Min Volatility)":
     target_ret = st.slider("Target return (annualized)", float(mu.min()), float(mu.max()), float(mu.mean()))
 
-if objective == "Max Sharpe":
-    weights, _ = solve_qp_max_sharpe(mu.values, cov.values, rf, bounds, w_sum=w_sum)
-elif objective == "Min Volatility":
-    weights, _ = solve_qp_min_vol_unconstrained(cov.values, bounds, w_sum=w_sum)
-else:
-    weights, _ = solve_qp_min_vol(mu.values, cov.values, target_ret, bounds, w_sum=w_sum)
+try:
+    if n == 1:
+        # short-circuit
+        weights = np.array([1.0])
+        opt_info = None
+    elif objective == "Max Sharpe":
+        weights, _ = solve_qp_max_sharpe(mu.values, cov.values, rf, bounds, w_sum=1.0)
+    elif objective == "Min Volatility":
+        weights, _ = solve_qp_min_vol_unconstrained(cov.values, bounds, w_sum=1.0)
+    else:
+        weights, _ = solve_qp_min_vol(mu.values, cov.values, float(target_ret), bounds, w_sum=1.0)
+except Exception as e:
+    st.error(f"Optimization failed: {e}")
+    st.stop()
 
-w_series = pd.Series(weights, index=assets)
 er, vol, sh = portfolio_metrics(weights, mu.values, cov.values, rf)
 
 c1, c2, c3 = st.columns(3)
@@ -209,21 +305,29 @@ c2.metric("Volatility", nice_percent(vol))
 c3.metric("Sharpe", f"{sh:.2f}")
 
 # Weights pie
-fig1, ax1 = plt.subplots()
-ax1.pie(w_series.clip(lower=0).values, labels=w_series.index, autopct="%1.1f%%", startangle=90)
-ax1.axis("equal")
-st.pyplot(fig1)
+w_series = pd.Series(weights, index=assets)
+nonneg = w_series.clip(lower=0)
+if nonneg.sum() <= 0:
+    st.warning("All weights are non-positive; pie chart skipped.")
+else:
+    fig1, ax1 = plt.subplots()
+    ax1.pie(nonneg.values, labels=nonneg.index, autopct="%1.1f%%", startangle=90)
+    ax1.axis("equal")
+    st.pyplot(fig1)
 
 # Efficient Frontier
 st.subheader("Efficient Frontier")
-ef = efficient_frontier(mu.values, cov.values, bounds, rf, points=40, w_sum=w_sum)
-fig2, ax2 = plt.subplots()
-ax2.plot(ef["Volatility"], ef["Return"])
-ax2.scatter([vol], [er], marker="*", s=200)
-ax2.set_xlabel("Volatility (σ)")
-ax2.set_ylabel("Expected Return (μ)")
-ax2.set_title("Efficient Frontier (long-only constrained)" if long_only else "Efficient Frontier")
-st.pyplot(fig2)
+ef = efficient_frontier(mu.values, cov.values, bounds, rf, points=40, w_sum=1.0)
+if ef.empty:
+    st.info("Efficient frontier requires at least two valid assets.")
+else:
+    fig2, ax2 = plt.subplots()
+    ax2.plot(ef["Volatility"], ef["Return"])
+    ax2.scatter([vol], [er], marker="*", s=200)
+    ax2.set_xlabel("Volatility (σ)")
+    ax2.set_ylabel("Expected Return (μ)")
+    ax2.set_title("Efficient Frontier (long-only constrained)" if long_only else "Efficient Frontier")
+    st.pyplot(fig2)
 
 # Weights table + download
 st.subheader("Optimized Weights")
