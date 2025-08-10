@@ -1,167 +1,91 @@
-import autogen
-from finrobot.agents.workflow import MultiAssistant, MultiAssistantWithLeader
-from finrobot.functional import get_rag_function
-from finrobot.utils import register_keys_from_json
-from textwrap import dedent
-from autogen import register_function
-from investment_group import group_config
+# app.py
+import io
+import math
+import numpy as np
+import pandas as pd
+import streamlit as st
 
+# Optional plotting (matplotlib) & yfinance
+import matplotlib.pyplot as plt
+from datetime import datetime
+try:
+    import yfinance as yf  # optional; app works without it
+    YF_OK = True
+except Exception:
+    YF_OK = False
 
-llm_config = {
-    "config_list": autogen.config_list_from_json(
-        "../OAI_CONFIG_LIST",
-        filter_dict={
-            "model": ["gpt-4-0125-preview"],
-        },
-    ),
-    "cache_seed": 42,
-    "temperature": 0,
-}
+st.set_page_config(page_title="Portfolio Optimizer", layout="wide")
 
-register_keys_from_json("../config_api_keys")
-
-# group_config = json.load(open("investment_group.json"))
-
-user_proxy = autogen.UserProxyAgent(
-    name="User",
-    # human_input_mode="ALWAYS",
-    human_input_mode="NEVER",
-    is_termination_msg=lambda x: x.get("content", "")
-    and "TERMINATE" in x.get("content", ""),
-    code_execution_config={
-        "last_n_messages": 3,
-        "work_dir": "quant",
-        "use_docker": False,
-    },
-)
-
-rag_func = get_rag_function(
-    retrieve_config={
-        "task": "qa",
-        "docs_path": "https://www.sec.gov/Archives/edgar/data/1737806/000110465923049927/pdd-20221231x20f.htm",
-        "chunk_token_size": 1000,
-        "collection_name": "pdd2022",
-        "get_or_create": True,
-    },
-)
-
-with_leader_config = {
-    "Market Sentiment Analysts": True,
-    "Risk Assessment Analysts": True,
-    "Fundamental Analysts": True,
-}
-
-representatives = []
-
-for group_name, single_group_config in group_config["groups"].items():
-
-    with_leader = with_leader_config.get(group_name)
-    if with_leader:
-        group_members = single_group_config["with_leader"]
-        group_members["agents"] = group_members.pop("employees")
-        group = MultiAssistantWithLeader(
-            group_members, llm_config=llm_config, user_proxy=user_proxy
-        )
+# ---------------------------
+# Helpers
+# ---------------------------
+def to_returns(df: pd.DataFrame, price_like=True):
+    """Return dataframe of periodic returns from prices or pass-through if already returns."""
+    df = df.sort_index()
+    if price_like:
+        r = df.pct_change().dropna(how="all")
     else:
-        group_members = single_group_config["without_leader"]
-        group_members["agents"] = group_members.pop("employees")
-        group = MultiAssistant(
-            group_members, llm_config=llm_config, user_proxy=user_proxy
-        )
+        r = df.copy()
+    # drop non-numeric cols
+    r = r.select_dtypes(include=[np.number])
+    return r.dropna(how="all", axis=1)
 
-    for agent in group.agents:
-        register_function(
-            rag_func,
-            caller=agent,
-            executor=group.user_proxy,
-            description="retrieve content from PDD's 2022 20-F Sec Filing for QA",
-        )
+def annualize(ret: pd.DataFrame, freq: str):
+    freq = freq.lower()
+    periods = {"daily":252, "weekly":52, "monthly":12, "quarterly":4, "yearly":1}[freq]
+    mu = ret.mean() * periods
+    cov = ret.cov() * periods
+    return mu, cov, periods
 
-    representatives.append(group.representative)
+def portfolio_metrics(w, mu, cov, rf=0.0):
+    w = np.asarray(w)
+    exp_ret = float(w @ mu)
+    vol = float(np.sqrt(w @ cov @ w))
+    sharpe = (exp_ret - rf) / vol if vol > 0 else np.nan
+    return exp_ret, vol, sharpe
 
+def solve_qp_max_sharpe(mu, cov, rf, bounds, w_sum=1.0):
+    # Maximize (mu - rf)·w / sqrt(w^T Σ w)
+    # Equivalent to maximize (mu-rf)·w subject to w^T Σ w = 1 (then scale).
+    # Easier: use scipy.minimize on negative Sharpe with constraints.
+    from scipy.optimize import minimize
 
-cio_config = group_config["CIO"]
-main_group_config = {"leader": cio_config, "agents": representatives}
-main_group = MultiAssistantWithLeader(
-    main_group_config, llm_config=llm_config, user_proxy=user_proxy
-)
+    n = len(mu)
+    mu_excess = mu - rf
 
-task = dedent(
-    """
-    Subject: Evaluate Investment Potential and Determine 6-Month Target Price for Pinduoduo (PDD)
+    def neg_sharpe(w):
+        r, v, s = portfolio_metrics(w, mu, cov, rf)
+        return -s
 
-    Task Description:
+    cons = [{"type": "eq", "fun": lambda w: np.sum(w) - w_sum}]
+    bnds = bounds if bounds is not None else tuple((0.0, 1.0) for _ in range(n))
+    x0 = np.full(n, 1.0/n)
+    res = minimize(neg_sharpe, x0, method="SLSQP", bounds=bnds, constraints=cons, options={"maxiter":1000})
+    return res.x, res
 
-    Today is 2023-04-26. As the Chief Investment Officer, your task is to evaluate the potential investment in Pinduoduo (PDD) based on the newly released 2022 annual report and recent market news. You will need to coordinate with the Market Sentiment Analysts, Risk Assessment Analysts, and Fundamental Analysts to gather and analyze the relevant information. Your final deliverable should include a comprehensive evaluation, a 6-month target price for PDD's stock, and a recommendation on whether to invest in Pinduoduo. 
+def solve_qp_min_vol(mu, cov, target_ret, bounds, w_sum=1.0):
+    from scipy.optimize import minimize
 
-    Notes:
+    n = len(mu)
+    def vol(w): return np.sqrt(w @ cov @ w)
 
-    All members in your group should be informed:
-    - Do not use any data after 2023-04-26, which is cheating.
+    cons = [
+        {"type":"eq", "fun": lambda w: np.sum(w) - w_sum},
+        {"type":"eq", "fun": lambda w: w @ mu - target_ret},
+    ]
+    bnds = bounds if bounds is not None else tuple((0.0, 1.0) for _ in range(n))
+    x0 = np.full(n, 1.0/n)
+    res = minimize(vol, x0, method="SLSQP", bounds=bnds, constraints=cons, options={"maxiter":1000})
+    return res.x, res
 
+def solve_qp_min_vol_unconstrained(cov, bounds, w_sum=1.0):
+    from scipy.optimize import minimize
+    n = cov.shape[0]
+    def vol(w): return np.sqrt(w @ cov @ w)
+    cons = [{"type":"eq", "fun": lambda w: np.sum(w) - w_sum}]
+    bnds = bounds if bounds is not None else tuple((0.0, 1.0) for _ in range(n))
+    x0 = np.full(n, 1.0/n)
+    res = minimize(vol, x0, method="SLSQP", bounds=bnds, constraints=cons, options={"maxiter":1000})
+    return res.x, res
 
-    Specific Instructions:
-
-    [Coordinate with Market Sentiment Analysts]:
-    Task: Analyze recent market sentiment surrounding PDD based on social media, news articles, and investor behavior.
-    Deliverable: Provide a sentiment score based on positive and negative mentions in the past few months.
-    
-    [Coordinate with Risk Assessment Analysts]:
-    Task: Assess the financial and operational risks highlighted in PDD's 2022 annual report (Form 20-F).
-    Deliverable: Provide a risk score considering factors such as debt levels, liquidity, market volatility, regulatory risks, and any legal proceedings.
-
-    [Coordinate with Fundamental Analysts]:
-    Task: Perform a detailed analysis of PDD's financial health based on the 2022 annual report.
-    Deliverable: Calculate key financial metrics such as Profit Margin, Return on Assets (ROA), and other relevant ratios.
-
-    [Determine 6-Month Target Price]:
-    Task: Based on the integrated analysis from all three groups, calculate a 6-month target price for PDD's stock.
-    Considerations: Current stock price, market sentiment, risk assessment, and financial health as indicated in the annual report.
-
-    [Final Deliverable]:
-    Integrate Findings: Compile the insights from all three groups to get a holistic view of Pinduoduo's potential.
-    Evaluation and 6-Month Target Price: Provide a 6-month target price for PDD's stock and a recommendation on whether to invest in Pinduoduo, including the rationale behind your decision.
-    """
-)
-
-# task = dedent(
-#     """
-#     As the Chief Investment Officer, your task is to evaluate the potential investment in Company ABC based on the provided data. You will need to coordinate with the Market Sentiment Analysts, Risk Assessment Analysts, and Fundamental Analysts to gather and analyze the relevant information. Your final deliverable should include a comprehensive evaluation and a recommendation on whether to invest in Company ABC.
-
-#     Specific Instructions:
-
-#     Coordinate with Market Sentiment Analysts:
-
-#     Task: Calculate the sentiment score based on the provided market sentiment data.
-#     Data: Positive mentions (80), Negative mentions (20)
-#     Formula: Sentiment Score = (Positive Mentions - Negative Mentions) / Total Mentions
-#     Expected Output: Sentiment Score (percentage)
-
-#     Coordinate with Risk Assessment Analysts:
-
-#     Task: Calculate the risk score using the provided financial ratios.
-#     Data:
-#     Debt-to-Equity Ratio: 1.5
-#     Current Ratio: 2.0
-#     Return on Equity (ROE): 0.1 (10%)
-#     Weights: Debt-to-Equity (0.5), Current Ratio (0.3), ROE (0.2)
-#     Formula: Risk Score = 0.5 * Debt-to-Equity + 0.3 * (1 / Current Ratio) - 0.2 * ROE
-#     Expected Output: Risk Score
-
-#     Coordinate with Fundamental Analysts:
-
-#     Task: Calculate the Profit Margin and Return on Assets (ROA) based on the provided financial data.
-#     Data:
-#     Revenue: $1,000,000
-#     Net Income: $100,000
-#     Total Assets: $500,000
-#     Formulas:
-#     Profit Margin = (Net Income / Revenue) * 100
-#     ROA = (Net Income / Total Assets) * 100
-#     Expected Outputs: Profit Margin (percentage) and ROA (percentage)
-
-#     Final Deliverable:
-#     Integrate Findings: Compile the insights from all three groups to get a holistic view of Company ABC's potential.
-#     Evaluation and Recommendation: Based on the integrated analysis, provide a recommendation on whether to invest in Company ABC, including the rationale behind your decision.
-# """
-# )
+def efficient_frontier(mu, cov, bounds, rf, points=30, w_sum
